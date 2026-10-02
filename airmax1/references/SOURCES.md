@@ -1,8 +1,15 @@
 # Visual & dimensional sources
 
-- https://www.nike.com/a/air-max-1-history — DNA archive sketches, visible Air origin
-- https://www.nike.com/gb/t/air-max-1-essential-shoes-V1zZh7yW/FZ5808-102 — product construction (mesh/suede/synthetic, Max Air, waffle)
-- https://www.nike.com/launch/t/behind-design-air-max-1-og-remaster — silhouette/stance notes
-- Independent lab stack/width measurements used for scale (heel 32.2 mm, FF 20.1 mm, midsole widths)
+## Nike / retail photography
+- Nike Air Max 1 Essential FZ5808-102 product gallery (SNS): lateral, 3/4, heel, detail
+  - `retail/FZ5808-102-01.jpg` … `08.jpg`
+- Nike.com Air Max 1 history / DNA archive sketches
+- Nike PDP lateral: `am1_pdp.png`
 
-Local image captures: `history_*.jpg`, `am1_pdp.png` from Nike CDN / DNA pages.
+## Dimensions
+- Nike DNA mudguard notes: 7 mm midfoot, 15–17 mm heel
+- Lab scale (men’s): heel stack 32.2 mm, forefoot 20.1 mm, midsole widths ~81.8 / 107.9 mm
+- Model length 295 mm (US 9 external)
+
+## Rebuild
+Feature curves / builder: `scripts/build_airmax1.py`

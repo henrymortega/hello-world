@@ -1,878 +1,974 @@
 #!/usr/bin/env python3
 """
-Build a componentized Nike Air Max 1 (Men's US 9, Left) as a Rhino .3dm.
+Realistic Nike Air Max 1 (US 9 Left) — componentized Rhino .3dm for V-Ray.
 
-Scale & construction references:
-  - Nike DNA archive notes: mudguard 7 mm midfoot / 15–17 mm heel
-  - Nike.com Air Max 1 history + Essential product construction
-    (mesh/suede/synthetic upper, Max Air heel, waffle outsole)
-  - Lab stack/width numbers for men's size scale
+Built from:
+  - Nike PDP / SNS FZ5808-102 multi-angle product photography
+  - Nike DNA archive mudguard notes (7 mm mid / 15–17 mm heel)
+  - Lab stack & width figures for men's scale
 
-Units: millimeters.
-Origin: heel at X≈0 on ground Z=0; +X toe; +Y lateral (left shoe); +Z up.
+Approach: thin panel shells on an accurate last (not solid sausage lofts),
+sculpted midsole with visible Max Air capsule, waffle outsole.
 """
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import rhino3dm as r3d
 
 from geometry_utils import (
     box_mesh,
-    closed_polyline,
     curve_from_pts,
     cylinder_mesh,
-    last_section,
-    lerp,
     loft_mesh,
     pipe_along_polyline,
     pt,
-    smoothstep,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "output" / "Nike_AirMax1_US9_Left.3dm"
 
-@dataclass(frozen=True)
-class AirMax1Spec:
-    external_length: float = 295.0
-    midsole_width_ff: float = 107.9
-    midsole_width_heel: float = 81.8
-    heel_stack: float = 32.2
-    forefoot_stack: float = 20.1
-    outsole_thickness: float = 5.7
-    insole_thickness: float = 3.6
-    toebox_height: float = 26.5
-    tongue_padding: float = 9.0
-    mudguard_mid_h: float = 7.0
-    mudguard_heel_h: float = 15.0
-    mudguard_heel_rear_h: float = 17.0
-    air_window_length: float = 48.0
-    air_window_height: float = 18.5
-    air_window_x_center: float = 42.0
-    air_pillar_count: int = 3
-    collar_height: float = 78.0
-    vamp_height: float = 52.0
-    eyelet_count: int = 6
+# ---------------------------------------------------------------------------
+# Spec (US 9)
+# ---------------------------------------------------------------------------
+L = 295.0  # external length mm
+HEEL_STACK = 32.2
+FF_STACK = 20.1
+OUTSOLE_T = 5.5
+HEEL_W = 81.8
+FF_W = 107.9
 
 
-SPEC = AirMax1Spec()
-OUT_PATH = Path(__file__).resolve().parents[1] / "output" / "Nike_AirMax1_US9_Left.3dm"
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def smoothstep(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 # ---------------------------------------------------------------------------
-# Profiles
+# Hand-tuned profiles from Nike FZ5808-102 lateral (heel=0 → toe=L)
+# Values are absolute Z from ground, or heights — matched to photo + lab.
 # ---------------------------------------------------------------------------
 
-def sole_half_width(x: float, s: AirMax1Spec) -> float:
-    t = x / s.external_length
-    if t < 0.18:
-        return lerp(s.midsole_width_heel * 0.5, s.midsole_width_heel * 0.52, t / 0.18)
-    if t < 0.45:
-        u = smoothstep((t - 0.18) / 0.27)
-        return lerp(s.midsole_width_heel * 0.52, s.midsole_width_ff * 0.48, u)
-    if t < 0.78:
-        u = smoothstep((t - 0.45) / 0.33)
-        return lerp(s.midsole_width_ff * 0.48, s.midsole_width_ff * 0.5, u)
-    u = smoothstep((t - 0.78) / 0.22)
-    return lerp(s.midsole_width_ff * 0.5, 27.0, u)
-
-
-def midsole_top_z(x: float, s: AirMax1Spec) -> float:
-    t = x / s.external_length
-    z = lerp(s.heel_stack, s.forefoot_stack, smoothstep(min(1.0, t / 0.85)))
-    if t > 0.88:
-        z += 2.8 * smoothstep((t - 0.88) / 0.12)
+def outsole_bottom_z(x):
+    """Ground contact with toe spring & slight heel lift."""
+    t = x / L
+    z = 0.0
+    if t > 0.82:
+        z = 3.5 * smoothstep((t - 0.82) / 0.18)  # toe spring
+    if t < 0.06:
+        z = 1.2 * (1 - t / 0.06)  # heel bevel
     return z
 
 
-def outsole_top_z(x: float, s: AirMax1Spec) -> float:
-    return s.outsole_thickness
+def outsole_top_z(x):
+    return outsole_bottom_z(x) + OUTSOLE_T
 
 
-def mudguard_height(x: float, s: AirMax1Spec) -> float:
-    t = x / s.external_length
-    if t < 0.12:
-        return lerp(s.mudguard_heel_rear_h, s.mudguard_heel_h, t / 0.12)
-    if t < 0.35:
-        return lerp(s.mudguard_heel_h, s.mudguard_mid_h, (t - 0.12) / 0.23)
-    if t < 0.55:
-        return s.mudguard_mid_h
-    if t < 0.78:
-        return lerp(s.mudguard_mid_h, 18.0, (t - 0.55) / 0.23)
-    return lerp(18.0, 22.0, (t - 0.78) / 0.22)
+def midsole_top_z(x):
+    """Top of midsole / bottom of upper — lab drop profile."""
+    t = x / L
+    z = lerp(HEEL_STACK, FF_STACK, smoothstep(min(1.0, t / 0.88)))
+    if t > 0.90:
+        z += 2.0 * smoothstep((t - 0.90) / 0.10)
+    return z + outsole_bottom_z(x) * 0.15
 
 
-def upper_height(x: float, s: AirMax1Spec) -> float:
-    t = x / s.external_length
-    base = midsole_top_z(x, s)
-    if t < 0.12:
-        h = s.collar_height - base
-    elif t < 0.28:
-        h = lerp(s.collar_height, s.vamp_height + 8, (t - 0.12) / 0.16) - base
-    elif t < 0.55:
-        h = lerp(s.vamp_height + 8, s.vamp_height, (t - 0.28) / 0.27) - base
-    elif t < 0.82:
-        h = lerp(s.vamp_height, s.toebox_height + 6, (t - 0.55) / 0.27) - base
+def mudguard_top_z(x):
+    """Black mudguard crest — Nike DNA wave (7 mid / 15–17 heel)."""
+    t = x / L
+    base = midsole_top_z(x)
+    if t < 0.10:
+        h = lerp(17.0, 15.0, t / 0.10)
+    elif t < 0.32:
+        h = lerp(15.0, 7.0, smoothstep((t - 0.10) / 0.22))
+    elif t < 0.52:
+        h = 7.0
+    elif t < 0.72:
+        h = lerp(7.0, 14.0, smoothstep((t - 0.52) / 0.20))
+    elif t < 0.88:
+        h = lerp(14.0, 20.0, smoothstep((t - 0.72) / 0.16))
     else:
-        h = lerp(s.toebox_height + 6, 9.0, (t - 0.82) / 0.18) - base
-    return max(8.0, h)
+        h = lerp(20.0, 16.0, (t - 0.88) / 0.12)
+    return base + h
 
 
-def shell_section(
-    x: float,
-    half_width: float,
-    z0: float,
-    height: float,
-    thickness: float,
-    crown: float,
-    count: int,
-    *,
-    z_max: float | None = None,
-    z_min: float | None = None,
-) -> list:
-    """Closed section for a thin shell: outer last slice, then inset return.
-
-    Approximates a hollow panel by using consecutive outer/inner loops as a
-    single closed polyline (outer then reversed inner).
-    """
-    outer = last_section(x, half_width, z0, height, crown=crown, count=count)
-    inner = last_section(
-        x,
-        max(4.0, half_width - thickness),
-        z0 + thickness * 0.35,
-        max(2.0, height - thickness),
-        crown=crown,
-        count=count,
-    )
-    # Optional vertical crop for overlays (mudguard band, etc.)
-    if z_max is not None or z_min is not None:
-        zlo = z_min if z_min is not None else -1e9
-        zhi = z_max if z_max is not None else 1e9
-
-        def crop(pts):
-            out = []
-            for p in pts:
-                z = min(zhi, max(zlo, p.Z))
-                out.append(pt(p.X, p.Y, z))
-            return out
-
-        outer = crop(outer)
-        inner = crop(inner)
-    # Build annulus as outer + reversed inner (for solid thin wall loft along X,
-    # we instead loft outer and separately loft inner — see thin_shell_loft).
-    return outer, inner
+def collar_top_z(x):
+    """Padded collar / upper topline (excludes tongue). Matched to FZ5808-102 lateral."""
+    t = x / L
+    # Heel collar ~78 mm, slopes down through eyestay, then toebox ~48–55 mm
+    if t < 0.04:
+        return lerp(52.0, 78.0, t / 0.04)
+    if t < 0.18:
+        return lerp(78.0, 74.0, (t - 0.04) / 0.14)
+    if t < 0.36:
+        return lerp(74.0, 62.0, smoothstep((t - 0.18) / 0.18))
+    if t < 0.55:
+        return lerp(62.0, 56.0, (t - 0.36) / 0.19)
+    if t < 0.72:
+        return lerp(56.0, 52.0, smoothstep((t - 0.55) / 0.17))
+    if t < 0.88:
+        return lerp(52.0, 40.0, smoothstep((t - 0.72) / 0.16))
+    return lerp(40.0, 24.0, smoothstep((t - 0.88) / 0.12))
 
 
-def thin_shell_loft(
-    xs: list[float],
-    outer_fn,
-    thickness_hint: float = 1.8,
-) -> r3d.Mesh:
-    """Loft a thin shell from outer sections and a slightly inset copy."""
-    outers = []
-    inners = []
+def tongue_top_z(x):
+    """Tongue peak — dominant mid silhouette on product photos (~110 mm)."""
+    t = x / L
+    base = collar_top_z(x)
+    if t < 0.28 or t > 0.82:
+        return base
+    u = (t - 0.28) / 0.54
+    # Smooth hump
+    peak = 110.0 * (math.sin(math.pi * u) ** 1.05)
+    return max(base, peak)
+
+
+def last_section_upper(x, inset=0.0, count=48):
+    """Closed upper last slice at X — rounded footwear section above midsole."""
+    z0 = midsole_top_z(x) + 0.2
+    z1 = collar_top_z(x)
+    hw0 = sole_half_width(x) * 0.90 - inset
+    pts = []
+    for i in range(count):
+        a = 2 * math.pi * i / count
+        # Param: 0 at bottom center going around
+        # Use elliptical last with flat-ish sole and rounded vamp
+        sy = math.sin(a)
+        cz = math.cos(a)  # +1 top, -1 bottom
+        if cz < 0:
+            # sole plate of upper (bottom)
+            y = hw0 * sy
+            z = z0 + 1.2 * (1 - abs(sy))  # slight camber
+        else:
+            # upper — taper width toward topline
+            u = cz  # 0 at mid sides → 1 at top
+            hw = hw0 * lerp(1.0, 0.70, u ** 1.15)
+            y = hw * sy
+            z = z0 + (z1 - z0) * (u ** 0.75)
+        pts.append(pt(x, y, z))
+    return pts
+
+
+def thin_last_shell(xs, thickness=2.0, count=48):
+    outer = [last_section_upper(x, 0.0, count) for x in xs]
+    inner = [last_section_upper(x, thickness, count) for x in xs]
+    # Build solid thin wall by lofting mid section (visual shell)
+    mid = []
+    for o, i in zip(outer, inner):
+        mid.append(
+            [
+                pt(0.5 * (a.X + b.X), 0.5 * (a.Y + b.Y), 0.5 * (a.Z + b.Z))
+                for a, b in zip(o, i)
+            ]
+        )
+    return loft_mesh(outer, True)
+
+
+def sole_half_width(x):
+    t = x / L
+    if t < 0.15:
+        return lerp(HEEL_W * 0.48, HEEL_W * 0.50, t / 0.15)
+    if t < 0.42:
+        return lerp(HEEL_W * 0.50, FF_W * 0.47, smoothstep((t - 0.15) / 0.27))
+    if t < 0.72:
+        return lerp(FF_W * 0.47, FF_W * 0.50, smoothstep((t - 0.42) / 0.30))
+    if t < 0.90:
+        return lerp(FF_W * 0.50, 38.0, smoothstep((t - 0.72) / 0.18))
+    return lerp(38.0, 18.0, smoothstep((t - 0.90) / 0.10))
+
+
+def upper_half_width(x, z):
+    """Last width at height z — tapers toward topline."""
+    hw0 = sole_half_width(x) * 0.92
+    z0 = midsole_top_z(x)
+    z1 = collar_top_z(x)
+    if z1 <= z0:
+        return hw0 * 0.85
+    u = clamp((z - z0) / (z1 - z0), 0, 1)
+    # AM1 last: relatively parallel sides then taper to collar
+    return hw0 * lerp(1.0, 0.72, u ** 1.1)
+
+
+# Air window (from photo + lab)
+AIR = dict(cx=42.0, cz=16.8, length=47.0, height=17.2, depth_scale=0.88)
+
+
+# ---------------------------------------------------------------------------
+# Mesh primitives for panels
+# ---------------------------------------------------------------------------
+
+def grid_shell(xs, z0_fn, z1_fn, y_sign, n_z=10, thickness=1.6, width_fn=None):
+    """Open panel on lateral (y_sign=+1) or medial (-1) side as a thin shell."""
+    if width_fn is None:
+        width_fn = upper_half_width
+    outer = []
+    inner = []
     for x in xs:
-        outer, inner = outer_fn(x)
-        outers.append(outer)
-        inners.append(inner)
-    # Connect outer loft surface with inner loft by building a solid from
-    # concatenated rows: for each x, use outer ring as section via last_section
-    # already closed. Create solid by lofting sections that are the outer ring
-    # only at first, then use dual surface approach:
-    # Practical approach: loft outer, loft inner, then bridge ends — for V-Ray
-    # blocking we create a single solid from mid-thickness ring:
-    mids = []
-    for o, i in zip(outers, inners):
-        mid = []
-        for a, b in zip(o, i):
-            mid.append(pt((a.X + b.X) * 0.5, (a.Y + b.Y) * 0.5, (a.Z + b.Z) * 0.5))
-        mids.append(mid)
-    # Solid thin volume: loft outer then append reversed inner along length ends
-    # Simpler robust method: loft "thick ring" sections (outer points only with
-    # small radial thickness baked by using last_section height/width deltas).
-    return loft_mesh(outers, cap=True), loft_mesh(inners, cap=False), loft_mesh(mids, cap=True)
+        row_o = []
+        row_i = []
+        z0 = z0_fn(x)
+        z1 = z1_fn(x)
+        if z1 <= z0 + 1.0:
+            z1 = z0 + 1.5
+        for j in range(n_z):
+            u = j / (n_z - 1)
+            z = lerp(z0, z1, u)
+            hw = width_fn(x, z)
+            y = y_sign * hw
+            row_o.append(pt(x, y, z))
+            row_i.append(pt(x, y - y_sign * thickness, z))
+        outer.append(row_o)
+        inner.append(row_i)
+    # Build mesh from outer grid + thickness bridge
+    mesh = r3d.Mesh()
+    # vertices: outer then inner
+    rows = len(xs)
+    cols = n_z
+    for row in outer:
+        for p in row:
+            mesh.Vertices.Add(p.X, p.Y, p.Z)
+    for row in inner:
+        for p in row:
+            mesh.Vertices.Add(p.X, p.Y, p.Z)
+
+    def vid(side, r, c):  # side 0 outer 1 inner
+        return side * rows * cols + r * cols + c
+
+    for r in range(rows - 1):
+        for c in range(cols - 1):
+            # outer
+            mesh.Faces.AddFace(vid(0, r, c), vid(0, r, c + 1), vid(0, r + 1, c + 1), vid(0, r + 1, c))
+            # inner (reversed)
+            mesh.Faces.AddFace(vid(1, r, c), vid(1, r + 1, c), vid(1, r + 1, c + 1), vid(1, r, c + 1))
+    # edges
+    for r in range(rows - 1):
+        mesh.Faces.AddFace(vid(0, r, 0), vid(0, r + 1, 0), vid(1, r + 1, 0), vid(1, r, 0))
+        mesh.Faces.AddFace(
+            vid(0, r, cols - 1), vid(1, r, cols - 1), vid(1, r + 1, cols - 1), vid(0, r + 1, cols - 1)
+        )
+    for c in range(cols - 1):
+        mesh.Faces.AddFace(vid(0, 0, c), vid(1, 0, c), vid(1, 0, c + 1), vid(0, 0, c + 1))
+        mesh.Faces.AddFace(
+            vid(0, rows - 1, c),
+            vid(0, rows - 1, c + 1),
+            vid(1, rows - 1, c + 1),
+            vid(1, rows - 1, c),
+        )
+    mesh.Normals.ComputeNormals()
+    mesh.Compact()
+    return mesh
+
+
+def vamp_top_shell(xs, n_y=12, thickness=1.8):
+    """Instep / toebox top panel across Y."""
+    rows = []
+    for x in xs:
+        z0 = midsole_top_z(x) + 1.0
+        z1 = min(tongue_top_z(x), collar_top_z(x) + 8)
+        # crown height at centerline
+        hw = upper_half_width(x, (z0 + z1) * 0.5)
+        row = []
+        for j in range(n_y):
+            v = j / (n_y - 1)
+            y = lerp(-hw, hw, v)
+            # elliptical crown
+            crown = math.sin(math.pi * v)
+            z = lerp(z0 + 2, z1, 0.35 + 0.65 * crown)
+            # near edges stay lower (mudguard meet)
+            edge = min(v, 1 - v) * 2
+            z = lerp(mudguard_top_z(x) + 1.0, z, smoothstep(edge))
+            row.append(pt(x, y, z))
+        rows.append(row)
+    # thicken downward
+    rows_i = []
+    for row in rows:
+        rows_i.append([pt(p.X, p.Y, p.Z - thickness) for p in row])
+    return loft_pair(rows, rows_i)
+
+
+def loft_pair(outer_rows, inner_rows):
+    mesh = r3d.Mesh()
+    rows = len(outer_rows)
+    cols = len(outer_rows[0])
+    for row in outer_rows:
+        for p in row:
+            mesh.Vertices.Add(p.X, p.Y, p.Z)
+    for row in inner_rows:
+        for p in row:
+            mesh.Vertices.Add(p.X, p.Y, p.Z)
+
+    def vid(side, r, c):
+        return side * rows * cols + r * cols + c
+
+    for r in range(rows - 1):
+        for c in range(cols - 1):
+            mesh.Faces.AddFace(vid(0, r, c), vid(0, r, c + 1), vid(0, r + 1, c + 1), vid(0, r + 1, c))
+            mesh.Faces.AddFace(vid(1, r, c), vid(1, r + 1, c), vid(1, r + 1, c + 1), vid(1, r, c + 1))
+    for r in range(rows - 1):
+        mesh.Faces.AddFace(vid(0, r, 0), vid(0, r + 1, 0), vid(1, r + 1, 0), vid(1, r, 0))
+        mesh.Faces.AddFace(
+            vid(0, r, cols - 1), vid(1, r, cols - 1), vid(1, r + 1, cols - 1), vid(0, r + 1, cols - 1)
+        )
+    for c in range(cols - 1):
+        mesh.Faces.AddFace(vid(0, 0, c), vid(1, 0, c), vid(1, 0, c + 1), vid(0, 0, c + 1))
+        mesh.Faces.AddFace(
+            vid(0, rows - 1, c),
+            vid(0, rows - 1, c + 1),
+            vid(1, rows - 1, c + 1),
+            vid(1, rows - 1, c),
+        )
+    mesh.Normals.ComputeNormals()
+    mesh.Compact()
+    return mesh
+
+
+def solid_loft_along_x(xs, section_fn):
+    return loft_mesh([section_fn(x) for x in xs], cap=True)
+
+
+def oval_section(x, half_w, z0, z1, count=36, squat=0.55):
+    """Vertical oval / rounded section in YZ."""
+    pts = []
+    h = max(1.0, z1 - z0)
+    cz = 0.5 * (z0 + z1)
+    for i in range(count):
+        a = 2 * math.pi * i / count
+        cy = math.sin(a)
+        czn = math.cos(a)
+        y = half_w * cy
+        exp = squat if czn < 0 else 0.85
+        z = cz + (h * 0.5) * math.copysign(abs(czn) ** exp, czn)
+        pts.append(pt(x, y, z))
+    return pts
 
 
 # ---------------------------------------------------------------------------
-# Document builder
+# Document
 # ---------------------------------------------------------------------------
 
-class DocBuilder:
-    def __init__(self) -> None:
+class Doc:
+    def __init__(self):
         self.doc = r3d.File3dm()
         self.doc.Settings.ModelUnitSystem = r3d.UnitSystem.Millimeters
         self.doc.Settings.ModelAbsoluteTolerance = 0.01
-        self.doc.ApplicationName = "AirMax1 Parametric Builder"
-        self.doc.ApplicationDetails = "Componentized Nike Air Max 1 for V-Ray"
-        self.doc.ApplicationUrl = "https://www.nike.com/a/air-max-1-history"
+        self.doc.ApplicationName = "AirMax1 Realistic Builder"
         self.doc.StartSectionComments = (
-            "Nike Air Max 1 — Men's US 9 Left | Units: mm | "
-            "Componentized for V-Ray. Sources: Nike DNA / nike.com; lab stack/width refs."
+            "Nike Air Max 1 US9 Left — realistic componentized model for V-Ray. "
+            "Profiles from Nike FZ5808-102 product photography + DNA/lab dimensions."
         )
-        self.doc.Strings["Project"] = "Nike_AirMax1_US9_Left"
-        self.doc.Strings["Size"] = "US9_Men_Left"
-        self.doc.Strings["VRay"] = "Materials named MAT_*; assign by object or layer"
-        self._layers: dict[str, int] = {}
-        self._materials: dict[str, int] = {}
-        self._groups: dict[str, int] = {}
+        self.layers = {}
+        self.mats = {}
+        self.groups = {}
 
-    @staticmethod
-    def _rgba(rgb: tuple[int, int, int], a: int = 255) -> tuple[int, int, int, int]:
-        return (rgb[0], rgb[1], rgb[2], a)
-
-    def layer(self, name: str, color: tuple[int, int, int], parent: str | None = None) -> int:
-        if name in self._layers:
-            return self._layers[name]
+    def layer(self, name, rgb, parent=None):
+        if name in self.layers:
+            return
         layer = r3d.Layer()
         layer.Name = name
-        layer.Color = self._rgba(color)
-        if parent and parent in self._layers:
-            layer.ParentLayerId = self.doc.Layers[self._layers[parent]].Id
-        idx = self.doc.Layers.Add(layer)
-        self._layers[name] = idx
-        return idx
+        layer.Color = (*rgb, 255)
+        if parent:
+            layer.ParentLayerId = self.doc.Layers[self.layers[parent]].Id
+        self.layers[name] = self.doc.Layers.Add(layer)
 
-    def material(
-        self,
-        name: str,
-        diffuse: tuple[int, int, int],
-        *,
-        transparency: float = 0.0,
-        shine: float = 0.3,
-        reflectivity: float = 0.05,
-        ior: float = 1.5,
-        metallic: float = 0.0,
-        roughness: float = 0.55,
-        notes: str = "",
-    ) -> int:
-        if name in self._materials:
-            return self._materials[name]
-        mat = r3d.Material()
-        mat.Name = name
-        mat.DiffuseColor = self._rgba(diffuse)
-        mat.SpecularColor = (255, 255, 255, 255)
-        mat.ReflectionColor = (255, 255, 255, 255)
-        mat.Transparency = transparency
-        mat.Shine = shine * 255.0
-        mat.Reflectivity = reflectivity
-        mat.IndexOfRefraction = ior
-        if notes:
-            mat.SetUserString("VRayHint", notes)
-            mat.SetUserString("Roughness", str(roughness))
-            mat.SetUserString("Metallic", str(metallic))
+    def material(self, name, rgb, **kw):
+        if name in self.mats:
+            return
+        m = r3d.Material()
+        m.Name = name
+        m.DiffuseColor = (*rgb, 255)
+        m.Transparency = kw.get("transparency", 0.0)
+        m.Shine = kw.get("shine", 0.3) * 255
+        m.Reflectivity = kw.get("reflectivity", 0.05)
+        m.IndexOfRefraction = kw.get("ior", 1.5)
+        hint = kw.get("notes", "")
+        if hint:
+            m.SetUserString("VRayHint", hint)
+            m.SetUserString("Roughness", str(kw.get("roughness", 0.5)))
         try:
-            mat.ToPhysicallyBased()
-            pbr = mat.PhysicallyBased
-            if pbr is not None:
-                pbr.Roughness = roughness
-                pbr.Metallic = metallic
-                pbr.Opacity = 1.0 - transparency
-                if transparency > 0.2:
-                    pbr.OpacityIOR = ior
+            m.ToPhysicallyBased()
+            p = m.PhysicallyBased
+            if p:
+                p.Roughness = kw.get("roughness", 0.5)
+                p.Metallic = kw.get("metallic", 0.0)
+                p.Opacity = 1.0 - kw.get("transparency", 0.0)
+                if kw.get("transparency", 0) > 0.2:
+                    p.OpacityIOR = kw.get("ior", 1.49)
         except Exception:
             pass
-        idx = self.doc.Materials.Add(mat)
-        self._materials[name] = idx
-        return idx
+        self.mats[name] = self.doc.Materials.Add(m)
 
-    def group(self, name: str) -> int:
-        if name in self._groups:
-            return self._groups[name]
+    def group(self, name):
+        if name in self.groups:
+            return
         g = r3d.Group()
         g.Name = name
         self.doc.Groups.Add(g)
-        found = self.doc.Groups.FindName(name)
-        idx = found.Index if found is not None else len(self.doc.Groups) - 1
-        self._groups[name] = idx
-        return idx
+        self.groups[name] = self.doc.Groups.FindName(name).Index
 
-    def add(self, geometry, *, name: str, layer: str, material: str, group: str | None = None, user: dict | None = None) -> None:
-        attrs = r3d.ObjectAttributes()
-        attrs.Name = name
-        attrs.LayerIndex = self._layers[layer]
-        attrs.MaterialIndex = self._materials[material]
-        attrs.MaterialSource = r3d.ObjectMaterialSource.MaterialFromObject
+    def add(self, geo, name, layer, mat, group=None, user=None):
+        a = r3d.ObjectAttributes()
+        a.Name = name
+        a.LayerIndex = self.layers[layer]
+        a.MaterialIndex = self.mats[mat]
+        a.MaterialSource = r3d.ObjectMaterialSource.MaterialFromObject
         if group:
-            attrs.AddToGroup(self._groups[group])
+            a.AddToGroup(self.groups[group])
         if user:
             for k, v in user.items():
-                attrs.SetUserString(k, str(v))
-        self.doc.Objects.Add(geometry, attrs)
+                a.SetUserString(k, str(v))
+        self.doc.Objects.Add(geo, a)
 
-    def add_curve(self, curve, *, name: str, layer: str) -> None:
-        attrs = r3d.ObjectAttributes()
-        attrs.Name = name
-        attrs.LayerIndex = self._layers[layer]
-        self.doc.Objects.AddCurve(curve, attrs)
+    def add_curve(self, crv, name, layer):
+        a = r3d.ObjectAttributes()
+        a.Name = name
+        a.LayerIndex = self.layers[layer]
+        self.doc.Objects.AddCurve(crv, a)
 
-    def save(self, path: Path) -> None:
+    def save(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.doc.Write(str(path), 8):
-            raise RuntimeError(f"Failed to write {path}")
+        assert self.doc.Write(str(path), 8)
 
 
-def setup_document(b: DocBuilder) -> None:
+def setup(d: Doc):
     parents = [
         ("00_Reference", (120, 120, 120)),
-        ("01_Sole", (40, 40, 40)),
-        ("02_Midsole", (230, 230, 230)),
+        ("01_Sole", (30, 30, 30)),
+        ("02_Midsole", (240, 240, 240)),
         ("03_AirUnit", (180, 220, 255)),
-        ("04_Upper", (200, 200, 200)),
-        ("05_Overlays", (160, 150, 140)),
-        ("06_Hardware", (30, 30, 30)),
-        ("07_SoftGoods", (240, 240, 240)),
+        ("04_Upper", (245, 245, 245)),
+        ("05_Overlays", (180, 175, 165)),
+        ("06_Hardware", (20, 20, 20)),
+        ("07_SoftGoods", (250, 250, 250)),
     ]
-    for name, col in parents:
-        b.layer(name, col)
-
-    children = [
-        ("00_Reference::Last_Curves", "00_Reference", (100, 100, 255)),
-        ("00_Reference::Dimensions", "00_Reference", (255, 180, 0)),
-        ("01_Sole::Outsole_Base", "01_Sole", (20, 20, 20)),
-        ("01_Sole::Waffle_Lugs", "01_Sole", (25, 25, 25)),
-        ("01_Sole::Toe_Wrap", "01_Sole", (180, 20, 30)),
-        ("01_Sole::Heel_Wrap", "01_Sole", (180, 20, 30)),
-        ("02_Midsole::Foam_Body", "02_Midsole", (245, 245, 245)),
-        ("03_AirUnit::Window", "03_AirUnit", (200, 230, 255)),
-        ("03_AirUnit::Membrane", "03_AirUnit", (220, 240, 255)),
+    for n, c in parents:
+        d.layer(n, c)
+    kids = [
+        ("00_Reference::Profiles", "00_Reference", (80, 80, 255)),
+        ("01_Sole::Outsole", "01_Sole", (15, 15, 15)),
+        ("01_Sole::Waffle", "01_Sole", (25, 25, 25)),
+        ("01_Sole::ToeHeelWrap", "01_Sole", (160, 20, 30)),
+        ("02_Midsole::Body", "02_Midsole", (245, 245, 245)),
+        ("03_AirUnit::Window", "03_AirUnit", (200, 230, 250)),
         ("03_AirUnit::Pillars", "03_AirUnit", (190, 210, 230)),
-        ("04_Upper::Toebox_Mesh", "04_Upper", (250, 250, 250)),
-        ("04_Upper::Vamp_Mesh", "04_Upper", (245, 245, 245)),
-        ("04_Upper::Quarter_Mesh", "04_Upper", (240, 240, 240)),
-        ("04_Upper::Collar", "04_Upper", (235, 235, 235)),
-        ("04_Upper::Lining", "04_Upper", (230, 230, 230)),
-        ("05_Overlays::Mudguard", "05_Overlays", (25, 25, 25)),
-        ("05_Overlays::Quarter_Suede", "05_Overlays", (210, 205, 195)),
-        ("05_Overlays::Heel_Counter", "05_Overlays", (205, 200, 190)),
-        ("05_Overlays::Heel_Tab", "05_Overlays", (215, 210, 200)),
-        ("05_Overlays::Swoosh", "05_Overlays", (15, 15, 15)),
-        ("05_Overlays::Eyestay", "05_Overlays", (250, 250, 250)),
-        ("06_Hardware::Eyelets", "06_Hardware", (40, 40, 40)),
-        ("06_Hardware::Lace_Lock", "06_Hardware", (20, 20, 20)),
+        ("03_AirUnit::Membrane", "03_AirUnit", (210, 225, 240)),
+        ("04_Upper::MeshBase", "04_Upper", (250, 250, 250)),
+        ("04_Upper::Collar", "04_Upper", (240, 240, 240)),
+        ("04_Upper::Lining", "04_Upper", (20, 20, 20)),
+        ("05_Overlays::Mudguard", "05_Overlays", (20, 20, 20)),
+        ("05_Overlays::SuedeQuarter", "05_Overlays", (210, 205, 195)),
+        ("05_Overlays::HeelCounter", "05_Overlays", (205, 200, 190)),
+        ("05_Overlays::Swoosh", "05_Overlays", (10, 10, 10)),
+        ("05_Overlays::Eyestay", "05_Overlays", (215, 210, 200)),
+        ("06_Hardware::Eyelets", "06_Hardware", (30, 30, 30)),
+        ("06_Hardware::LaceLock", "06_Hardware", (15, 15, 15)),
         ("07_SoftGoods::Tongue", "07_SoftGoods", (250, 250, 250)),
-        ("07_SoftGoods::Tongue_Label", "07_SoftGoods", (255, 255, 255)),
         ("07_SoftGoods::Laces", "07_SoftGoods", (245, 245, 245)),
-        ("07_SoftGoods::Insole", "07_SoftGoods", (240, 240, 235)),
+        ("07_SoftGoods::Insole", "07_SoftGoods", (235, 232, 225)),
+        ("07_SoftGoods::TongueLabel", "07_SoftGoods", (255, 255, 255)),
     ]
-    for name, parent, col in children:
-        b.layer(name, col, parent=parent)
+    for n, p, c in kids:
+        d.layer(n, c, p)
 
     mats = [
-        ("MAT_Rubber_Outsole", (18, 18, 18), dict(shine=0.25, roughness=0.65, notes="V-Ray black rubber")),
-        ("MAT_Rubber_Accent", (170, 25, 35), dict(shine=0.3, roughness=0.55, notes="OG University Red wrap")),
-        ("MAT_Foam_Midsole", (245, 245, 242), dict(shine=0.15, roughness=0.75, notes="Phylon foam, matte SSS optional")),
-        ("MAT_Air_Clear", (210, 230, 245), dict(transparency=0.72, shine=0.85, reflectivity=0.15, ior=1.49, roughness=0.05, notes="Clear TPU window IOR~1.49")),
-        ("MAT_Air_Membrane", (200, 215, 230), dict(transparency=0.35, shine=0.4, roughness=0.25, notes="Translucent air bag")),
-        ("MAT_Air_Pillar", (185, 200, 215), dict(transparency=0.25, shine=0.5, roughness=0.2, notes="Visible Air ribs")),
-        ("MAT_Mesh_Upper", (248, 248, 246), dict(shine=0.1, roughness=0.8, notes="Engineered mesh + weave maps")),
-        ("MAT_Suede_Overlay", (208, 202, 190), dict(shine=0.05, roughness=0.9, notes="Nubuck/suede bone")),
-        ("MAT_Synthetic_Mudguard", (22, 22, 22), dict(shine=0.35, roughness=0.45, notes="Synthetic leather mudguard")),
-        ("MAT_Synthetic_Swoosh", (12, 12, 12), dict(shine=0.4, roughness=0.4, notes="Swoosh overlay")),
-        ("MAT_Collar_Textile", (236, 236, 234), dict(shine=0.08, roughness=0.85, notes="Padded collar textile")),
-        ("MAT_Plastic_Hardware", (28, 28, 28), dict(shine=0.55, roughness=0.3, metallic=0.05, notes="Lace lock / eyelets")),
-        ("MAT_Lace", (242, 242, 240), dict(shine=0.12, roughness=0.7, notes="Flat woven lace")),
-        ("MAT_Tongue_Label", (250, 250, 250), dict(shine=0.2, roughness=0.5, notes="Woven tongue label")),
-        ("MAT_Insole", (235, 232, 225), dict(shine=0.1, roughness=0.8, notes="Removable sockliner")),
+        ("MAT_Rubber", (22, 22, 22), dict(roughness=0.7, shine=0.2, notes="Black rubber outsole")),
+        ("MAT_Rubber_Red", (170, 30, 35), dict(roughness=0.55, shine=0.3, notes="OG accent wrap")),
+        ("MAT_Foam", (248, 248, 245), dict(roughness=0.8, shine=0.12, notes="White phylon midsole")),
+        ("MAT_AirClear", (200, 225, 240), dict(transparency=0.78, ior=1.49, roughness=0.04, shine=0.9, reflectivity=0.12, notes="Clear TPU Max Air window")),
+        ("MAT_AirMem", (195, 210, 225), dict(transparency=0.4, ior=1.4, roughness=0.2, shine=0.4, notes="Air bag membrane")),
+        ("MAT_AirPillar", (180, 195, 210), dict(transparency=0.3, roughness=0.15, shine=0.5, notes="Air unit ribs")),
+        ("MAT_Mesh", (250, 250, 248), dict(roughness=0.85, shine=0.08, notes="Engineered mesh — add weave opacity/bump")),
+        ("MAT_Suede", (206, 200, 188), dict(roughness=0.92, shine=0.04, notes="Bone/grey suede overlays")),
+        ("MAT_LeatherBlk", (18, 18, 18), dict(roughness=0.42, shine=0.38, notes="Synthetic leather mudguard/swoosh")),
+        ("MAT_Collar", (245, 245, 243), dict(roughness=0.8, shine=0.08, notes="Padded collar mesh")),
+        ("MAT_Lining", (25, 25, 25), dict(roughness=0.75, shine=0.1, notes="Black interior lining")),
+        ("MAT_Plastic", (25, 25, 25), dict(roughness=0.28, shine=0.55, metallic=0.04, notes="Lace lock / eyelets")),
+        ("MAT_Lace", (245, 245, 243), dict(roughness=0.7, shine=0.12, notes="Flat lace")),
+        ("MAT_Label", (255, 255, 255), dict(roughness=0.45, shine=0.25, notes="Tongue woven label")),
+        ("MAT_Insole", (236, 232, 224), dict(roughness=0.8, shine=0.1, notes="Sockliner")),
     ]
-    for name, diff, kw in mats:
-        b.material(name, diff, **kw)
-
-    for g in ("GRP_Outsole", "GRP_Midsole", "GRP_AirUnit", "GRP_Upper", "GRP_Overlays", "GRP_Hardware", "GRP_SoftGoods"):
-        b.group(g)
-
-
-def band_section(x, hw, z0, z1, count=36):
-    """Low wrap band between z0 and z1 (mudguard-like)."""
-    pts = []
-    # bottom lateral -> toe-ish not needed; full perimeter at mid height with vertical extent
-    # Represent as last_section cropped
-    h = max(1.5, z1 - z0)
-    return last_section(x, hw, z0, h, crown=0.08, count=count)
+    for n, rgb, kw in mats:
+        d.material(n, rgb, **kw)
+    for g in ["GRP_Sole", "GRP_Midsole", "GRP_Air", "GRP_Upper", "GRP_Overlays", "GRP_Hardware", "GRP_Soft"]:
+        d.group(g)
 
 
 # ---------------------------------------------------------------------------
-# Components
+# Build components
 # ---------------------------------------------------------------------------
 
-def build_outsole(b: DocBuilder, s: AirMax1Spec) -> None:
-    xs = [i * s.external_length / 28 for i in range(29)]
-    sections = [
-        last_section(x, sole_half_width(x, s), 0.1, outsole_top_z(x, s) - 0.1, crown=0.12, count=40)
-        for x in xs
+def build_profiles(d: Doc):
+    xs = list(np.linspace(0, L, 60))
+    curves = [
+        ("Profile_OutsoleBottom", [pt(x, 0, outsole_bottom_z(x)) for x in xs]),
+        ("Profile_OutsoleTop", [pt(x, 0, outsole_top_z(x)) for x in xs]),
+        ("Profile_MidsoleTop", [pt(x, 0, midsole_top_z(x)) for x in xs]),
+        ("Profile_MudguardCrest", [pt(x, sole_half_width(x), mudguard_top_z(x)) for x in xs]),
+        ("Profile_Collar", [pt(x, 0, collar_top_z(x)) for x in xs]),
+        ("Profile_SilhouetteTop", [pt(x, 0, tongue_top_z(x)) for x in xs]),
     ]
-    b.add(
-        loft_mesh(sections, cap=True),
-        name="Outsole_Base",
-        layer="01_Sole::Outsole_Base",
-        material="MAT_Rubber_Outsole",
-        group="GRP_Outsole",
-        user={"Component": "Outsole", "VRayMaterial": "Rubber_Black"},
+    for name, pts in curves:
+        d.add_curve(curve_from_pts(pts, 3), name, "00_Reference::Profiles")
+
+
+def build_outsole(d: Doc):
+    xs = list(np.linspace(0, L, 36))
+
+    def sec(x):
+        return oval_section(x, sole_half_width(x) * 0.98, outsole_bottom_z(x), outsole_top_z(x), 40, squat=0.35)
+
+    d.add(
+        solid_loft_along_x(xs, sec),
+        "Outsole_Base",
+        "01_Sole::Outsole",
+        "MAT_Rubber",
+        "GRP_Sole",
     )
 
-    lug_h = 2.8
-    for ix in range(6):
-        for iy in range(-3, 4):
-            x = 155 + ix * 14
-            y = iy * 11.5
-            if abs(y) > sole_half_width(x, s) - 8:
+    # Waffle lugs — AM1 style square grid forefoot + heel pods
+    for ix in range(7):
+        for iy in range(-4, 5):
+            x = 145 + ix * 13.5
+            y = iy * 10.5
+            if abs(y) > sole_half_width(x) - 9:
                 continue
-            b.add(
-                box_mesh(x - 3.75, y - 3.75, 0.0, x + 3.75, y + 3.75, lug_h),
-                name=f"Waffle_FF_{ix}_{iy}",
-                layer="01_Sole::Waffle_Lugs",
-                material="MAT_Rubber_Outsole",
-                group="GRP_Outsole",
+            z0 = outsole_bottom_z(x) - 0.2
+            d.add(
+                box_mesh(x - 3.4, y - 3.4, z0 - 2.6, x + 3.4, y + 3.4, z0 + 0.4),
+                f"Waffle_FF_{ix}_{iy}",
+                "01_Sole::Waffle",
+                "MAT_Rubber",
+                "GRP_Sole",
             )
     for ix in range(3):
         for iy in range(-2, 3):
-            x = 18 + ix * 16
-            y = iy * 12
-            if abs(y) > sole_half_width(x, s) - 6:
+            x = 16 + ix * 15
+            y = iy * 11
+            if abs(y) > sole_half_width(x) - 7:
                 continue
-            b.add(
-                box_mesh(x - 6, y - 5.5, 0.0, x + 6, y + 5.5, lug_h + 0.4),
-                name=f"Waffle_Heel_{ix}_{iy}",
-                layer="01_Sole::Waffle_Lugs",
-                material="MAT_Rubber_Outsole",
-                group="GRP_Outsole",
+            z0 = outsole_bottom_z(x) - 0.2
+            d.add(
+                box_mesh(x - 5.5, y - 5.0, z0 - 2.8, x + 5.5, y + 5.0, z0 + 0.3),
+                f"Waffle_Heel_{ix}_{iy}",
+                "01_Sole::Waffle",
+                "MAT_Rubber",
+                "GRP_Sole",
             )
 
-    toe_xs = [s.external_length - 38 + i * 4 for i in range(10) if s.external_length - 38 + i * 4 < s.external_length - 1]
-    b.add(
-        loft_mesh(
-            [last_section(x, sole_half_width(x, s) * 1.01, 0.3, outsole_top_z(x, s) + 3.2, crown=0.15, count=36) for x in toe_xs],
-            cap=True,
+    # Toe / heel wraps (heritage)
+    toe_xs = list(np.linspace(L - 42, L - 2, 12))
+    d.add(
+        solid_loft_along_x(
+            toe_xs,
+            lambda x: oval_section(
+                x, sole_half_width(x) * 1.01, outsole_bottom_z(x), outsole_top_z(x) + 3.0, 36, 0.3
+            ),
         ),
-        name="Outsole_Toe_Wrap",
-        layer="01_Sole::Toe_Wrap",
-        material="MAT_Rubber_Accent",
-        group="GRP_Outsole",
-        user={"OGColor": "UniversityRed"},
+        "Outsole_ToeWrap",
+        "01_Sole::ToeHeelWrap",
+        "MAT_Rubber_Red",
+        "GRP_Sole",
     )
-    heel_xs = [i * 4.0 for i in range(10)]
-    b.add(
-        loft_mesh(
-            [last_section(x, sole_half_width(x, s) * 1.01, 0.3, outsole_top_z(x, s) + 2.2, crown=0.15, count=36) for x in heel_xs],
-            cap=True,
+    heel_xs = list(np.linspace(1, 38, 12))
+    d.add(
+        solid_loft_along_x(
+            heel_xs,
+            lambda x: oval_section(
+                x, sole_half_width(x) * 1.01, outsole_bottom_z(x), outsole_top_z(x) + 2.2, 36, 0.3
+            ),
         ),
-        name="Outsole_Heel_Wrap",
-        layer="01_Sole::Heel_Wrap",
-        material="MAT_Rubber_Accent",
-        group="GRP_Outsole",
-        user={"OGColor": "UniversityRed"},
+        "Outsole_HeelWrap",
+        "01_Sole::ToeHeelWrap",
+        "MAT_Rubber_Red",
+        "GRP_Sole",
     )
 
 
-def build_midsole(b: DocBuilder, s: AirMax1Spec) -> None:
-    xs = [i * s.external_length / 32 for i in range(33)]
-    sections = []
-    for x in xs:
-        z0 = outsole_top_z(x, s) - 0.2
-        z1 = midsole_top_z(x, s)
-        sections.append(
-            last_section(x, sole_half_width(x, s) * 0.99, z0, max(4.0, z1 - z0), crown=0.22, count=44)
+def build_midsole(d: Doc):
+    xs = list(np.linspace(0, L, 44))
+
+    def sec(x):
+        # Slight waist in midfoot; fuller heel & forefoot — AM1 read
+        t = x / L
+        waist = 1.0 - 0.04 * math.sin(math.pi * clamp((t - 0.15) / 0.55, 0, 1))
+        return oval_section(
+            x,
+            sole_half_width(x) * 0.995 * waist,
+            outsole_top_z(x) - 0.3,
+            midsole_top_z(x),
+            48,
+            squat=0.42,
         )
-    b.add(
-        loft_mesh(sections, cap=True),
-        name="Midsole_Foam",
-        layer="02_Midsole::Foam_Body",
-        material="MAT_Foam_Midsole",
-        group="GRP_Midsole",
-        user={
-            "HeelStack_mm": s.heel_stack,
-            "ForefootStack_mm": s.forefoot_stack,
-            "Drop_mm": round(s.heel_stack - s.forefoot_stack, 2),
-        },
+
+    d.add(
+        solid_loft_along_x(xs, sec),
+        "Midsole_Foam",
+        "02_Midsole::Body",
+        "MAT_Foam",
+        "GRP_Midsole",
+        user={"HeelStack_mm": HEEL_STACK, "ForefootStack_mm": FF_STACK},
     )
 
+    # Flex grooves (visual AM1 midsole notches near ball)
+    for x in (195.0, 210.0):
+        hw = sole_half_width(x) * 0.99
+        z0 = outsole_top_z(x) + 2
+        z1 = midsole_top_z(x) - 1
+        d.add(
+            box_mesh(x - 1.2, -hw - 0.5, z0, x + 1.2, hw + 0.5, z1),
+            f"Midsole_FlexGroove_{int(x)}",
+            "02_Midsole::Body",
+            "MAT_Foam",
+            "GRP_Midsole",
+        )
 
-def build_air_unit(b: DocBuilder, s: AirMax1Spec) -> None:
-    cx = s.air_window_x_center
-    half_l = s.air_window_length * 0.5
-    half_h = s.air_window_height * 0.5
-    z_mid = outsole_top_z(cx, s) + (midsole_top_z(cx, s) - outsole_top_z(cx, s)) * 0.42
-    hw = sole_half_width(cx, s)
 
+def build_air_unit(d: Doc):
+    cx, cz = AIR["cx"], AIR["cz"]
+    hl, hh = AIR["length"] * 0.5, AIR["height"] * 0.5
+    hw = sole_half_width(cx) * AIR["depth_scale"]
+
+    # Capsule window through midsole (clear shell)
     secs = []
+    for i in range(16):
+        t = i / 15
+        x = cx - hl + AIR["length"] * t
+        # rounded ends
+        if t < 0.12:
+            s = math.sin((t / 0.12) * math.pi / 2)
+        elif t > 0.88:
+            s = math.sin(((1 - t) / 0.12) * math.pi / 2)
+        else:
+            s = 1.0
+        h = hh * (0.65 + 0.35 * s)
+        w = hw * (0.92 + 0.08 * s)
+        secs.append(oval_section(x, w, cz - h, cz + h, 28, squat=0.95))
+    d.add(loft_mesh(secs, True), "AirUnit_Window", "03_AirUnit::Window", "MAT_AirClear", "GRP_Air")
+
+    # Membrane bag
+    mem = []
     for i in range(12):
         t = i / 11
-        x = cx - half_l + s.air_window_length * t
-        rx = 1.0
-        if t < 0.12:
-            rx = math.sin((t / 0.12) * math.pi / 2)
-        elif t > 0.88:
-            rx = math.sin(((1 - t) / 0.12) * math.pi / 2)
-        h = half_h * (0.7 + 0.3 * rx)
-        secs.append(last_section(x, hw * 0.91, z_mid - h, h * 2, crown=0.9, count=36))
-    b.add(
-        loft_mesh(secs, cap=True),
-        name="AirUnit_Window",
-        layer="03_AirUnit::Window",
-        material="MAT_Air_Clear",
-        group="GRP_AirUnit",
-        user={"Component": "MaxAir_Window", "Note": "1987 visible Air — refractive clear TPU"},
+        x = cx - hl + 3 + (AIR["length"] - 6) * t
+        mem.append(oval_section(x, hw * 0.68, cz - hh * 0.72, cz + hh * 0.72, 24, 0.98))
+    d.add(loft_mesh(mem, True), "AirUnit_Membrane", "03_AirUnit::Membrane", "MAT_AirMem", "GRP_Air")
+
+    # 3 vertical pillars (classic AM1)
+    for i in range(3):
+        t = (i + 1) / 4
+        x = cx - hl + AIR["length"] * t
+        d.add(
+            box_mesh(x - 1.4, -hw * 0.5, cz - hh * 0.78, x + 1.4, hw * 0.5, cz + hh * 0.78),
+            f"AirUnit_Pillar_{i+1}",
+            "03_AirUnit::Pillars",
+            "MAT_AirPillar",
+            "GRP_Air",
+        )
+
+
+def build_upper(d: Doc):
+    # Primary upper volume — thin rounded last shell (mesh base)
+    xs = list(np.linspace(4, L - 4, 46))
+    d.add(
+        thin_last_shell(xs, thickness=2.2, count=48),
+        "Upper_Mesh_Last",
+        "04_Upper::MeshBase",
+        "MAT_Mesh",
+        "GRP_Upper",
+        user={"Note": "Main upper last shell — assign mesh material"},
     )
 
-    mem = []
+    # Collar pad (thicker band near opening, rear half)
+    xs_col = list(np.linspace(4, 125, 26))
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        d.add(
+            grid_shell(
+                xs_col,
+                lambda x: collar_top_z(x) - 16,
+                collar_top_z,
+                sign,
+                n_z=7,
+                thickness=3.5,
+                width_fn=lambda x, z: upper_half_width(x, z) * 1.02,
+            ),
+            f"Collar_{tag}",
+            "04_Upper::Collar",
+            "MAT_Collar",
+            "GRP_Upper",
+        )
+
+    # Black lining
+    xs_lin = list(np.linspace(6, 115, 22))
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        d.add(
+            grid_shell(
+                xs_lin,
+                lambda x: midsole_top_z(x) + 6,
+                lambda x: collar_top_z(x) - 3,
+                sign,
+                n_z=9,
+                thickness=1.2,
+                width_fn=lambda x, z: upper_half_width(x, z) * 0.86,
+            ),
+            f"Lining_{tag}",
+            "04_Upper::Lining",
+            "MAT_Lining",
+            "GRP_Upper",
+        )
+
+
+def build_mudguard(d: Doc):
+    xs = list(np.linspace(2, L - 2, 48))
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        d.add(
+            grid_shell(
+                xs,
+                lambda x: midsole_top_z(x) - 0.8,
+                mudguard_top_z,
+                sign,
+                n_z=8,
+                thickness=1.8,
+                width_fn=lambda x, z: sole_half_width(x) * 0.94,
+            ),
+            f"Mudguard_{tag}",
+            "05_Overlays::Mudguard",
+            "MAT_LeatherBlk",
+            "GRP_Overlays",
+            user={"DNA_Mid_mm": 7, "DNA_Heel_mm": 15},
+        )
+    # Toe mudguard bumper (low wrap over toebox front)
+    xs_toe = list(np.linspace(L - 50, L - 3, 16))
+    rows = []
+    for x in xs_toe:
+        hw = sole_half_width(x) * 0.95
+        z0 = midsole_top_z(x) - 0.5
+        z1 = mudguard_top_z(x)
+        row = []
+        for j in range(12):
+            v = j / 11
+            y = lerp(-hw, hw, v)
+            edge = min(v, 1 - v) * 2
+            z = lerp(z0 + 1.0, z1, 0.25 + 0.75 * math.sin(math.pi * v))
+            row.append(pt(x, y, z))
+        rows.append(row)
+    rows_i = [[pt(p.X, p.Y, max(midsole_top_z(p.X) - 0.2, p.Z - 2.0)) for p in row] for row in rows]
+    d.add(loft_pair(rows, rows_i), "Mudguard_ToeCap", "05_Overlays::Mudguard", "MAT_LeatherBlk", "GRP_Overlays")
+
+
+def build_suede_overlays(d: Doc):
+    # Quarter suede above mudguard
+    xs = list(np.linspace(70, 200, 32))
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        d.add(
+            grid_shell(
+                xs,
+                lambda x: mudguard_top_z(x) - 1.0,
+                lambda x: lerp(mudguard_top_z(x) + 28, collar_top_z(x) - 6, clamp((x - 70) / 130, 0, 1)),
+                sign,
+                n_z=10,
+                thickness=1.4,
+            ),
+            f"Quarter_Suede_{tag}",
+            "05_Overlays::SuedeQuarter",
+            "MAT_Suede",
+            "GRP_Overlays",
+        )
+
+    # Heel counter
+    xs_h = list(np.linspace(2, 70, 22))
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        d.add(
+            grid_shell(
+                xs_h,
+                lambda x: mudguard_top_z(x) - 0.5,
+                lambda x: collar_top_z(x) - 4,
+                sign,
+                n_z=10,
+                thickness=1.5,
+            ),
+            f"HeelCounter_{tag}",
+            "05_Overlays::HeelCounter",
+            "MAT_Suede",
+            "GRP_Overlays",
+            user={"Branding": "NIKE AIR"},
+        )
+    # Heel back panel
+    secs = []
     for i in range(10):
-        t = i / 9
-        x = cx - half_l + 3 + (s.air_window_length - 6) * t
-        h = half_h * 0.75
-        mem.append(last_section(x, hw * 0.70, z_mid - h, h * 2, crown=0.92, count=32))
-    b.add(
-        loft_mesh(mem, cap=True),
-        name="AirUnit_Membrane",
-        layer="03_AirUnit::Membrane",
-        material="MAT_Air_Membrane",
-        group="GRP_AirUnit",
-    )
-
-    for i in range(s.air_pillar_count):
-        t = (i + 1) / (s.air_pillar_count + 1)
-        x = cx - half_l + s.air_window_length * t
-        b.add(
-            box_mesh(x - 1.5, -hw * 0.52, z_mid - half_h * 0.82, x + 1.5, hw * 0.52, z_mid + half_h * 0.82),
-            name=f"AirUnit_Pillar_{i+1}",
-            layer="03_AirUnit::Pillars",
-            material="MAT_Air_Pillar",
-            group="GRP_AirUnit",
-        )
+        x = 1 + i * 2.2
+        w = 22 - i * 1.1
+        z0 = mudguard_top_z(x) + 2
+        z1 = collar_top_z(x) - 2
+        secs.append(oval_section(x, w * 0.45, z0, z1, 20, 0.7))
+    d.add(loft_mesh(secs, True), "HeelTab", "05_Overlays::HeelCounter", "MAT_Suede", "GRP_Overlays")
 
 
-def build_upper_shells(b: DocBuilder, s: AirMax1Spec) -> None:
-    """Upper as thinner regional shells (not full solid last)."""
-
-    def region(x0, x1, layer, mat, name, width_scale=0.90, height_scale=1.0, thick=2.2, crown=0.55):
-        xs = []
-        x = x0
-        while x <= x1:
-            xs.append(x)
-            x += 4.0
-        if xs[-1] < x1:
-            xs.append(x1)
-        # Thin solid via outer section with reduced height and slight inset mid ring
-        sections = []
-        for x in xs:
-            hw = sole_half_width(x, s) * width_scale
-            z0 = midsole_top_z(x, s) - 0.3
-            h = upper_height(x, s) * height_scale
-            # Use a "wall" thickness by lofting a mid-radius section (visual shell)
-            sections.append(last_section(x, hw, z0, max(6.0, h), crown=crown, count=48))
-        # Create shell look: add outer and a second inset loft as lining partner only for full upper
-        b.add(
-            loft_mesh(sections, cap=True),
-            name=name,
-            layer=layer,
-            material=mat,
-            group="GRP_Upper",
-            user={"Component": name, "ThicknessHint_mm": thick},
-        )
-
-    region(0, 58, "04_Upper::Collar", "MAT_Collar_Textile", "Upper_Collar_Zone", 0.88, 1.0, 3.0, 0.6)
-    region(48, 135, "04_Upper::Quarter_Mesh", "MAT_Mesh_Upper", "Upper_Quarter_Mesh", 0.89, 0.92, 2.0, 0.55)
-    region(125, 225, "04_Upper::Vamp_Mesh", "MAT_Mesh_Upper", "Upper_Vamp_Mesh", 0.90, 0.88, 2.0, 0.5)
-    region(210, s.external_length - 2, "04_Upper::Toebox_Mesh", "MAT_Mesh_Upper", "Upper_Toebox_Mesh", 0.91, 0.75, 2.0, 0.45)
-
-    # Lining inset
-    xs = [i * 3.5 for i in range(20)]
-    lining = [
-        last_section(
-            x,
-            sole_half_width(x, s) * 0.80,
-            midsole_top_z(x, s) + 1.2,
-            upper_height(x, s) * 0.82,
-            crown=0.6,
-            count=40,
-        )
-        for x in xs
+def build_swoosh(d: Doc):
+    """Nike Swoosh — placed on quarter, proportions from FZ5808-102 lateral."""
+    spine = [
+        (170, 0.78, 8, 3.5),
+        (160, 0.88, 10, 5.5),
+        (148, 0.96, 14, 8.5),
+        (136, 0.99, 18, 11.0),
+        (124, 0.98, 24, 11.5),
+        (112, 0.92, 30, 10.0),
+        (100, 0.82, 35, 8.0),
+        (90, 0.68, 38, 5.5),
+        (82, 0.50, 39, 3.5),
+        (76, 0.32, 37, 2.0),
     ]
-    b.add(
-        loft_mesh(lining, cap=True),
-        name="Upper_Lining",
-        layer="04_Upper::Lining",
-        material="MAT_Collar_Textile",
-        group="GRP_Upper",
-    )
-
-
-def build_mudguard(b: DocBuilder, s: AirMax1Spec) -> None:
-    xs = [i * s.external_length / 40 for i in range(41)]
-    sections = []
-    for x in xs:
-        z0 = midsole_top_z(x, s) - 0.8
-        h = mudguard_height(x, s)
-        # Keep mudguard as a low band — critical AM1 read
-        sections.append(
-            band_section(x, sole_half_width(x, s) * 0.935, z0, z0 + h, count=44)
-        )
-    b.add(
-        loft_mesh(sections, cap=True),
-        name="Mudguard",
-        layer="05_Overlays::Mudguard",
-        material="MAT_Synthetic_Mudguard",
-        group="GRP_Overlays",
-        user={
-            "DNA_MidHeight_mm": s.mudguard_mid_h,
-            "DNA_HeelHeight_mm": s.mudguard_heel_h,
-            "DNA_HeelRear_mm": s.mudguard_heel_rear_h,
-        },
-    )
-
-
-def build_quarter_and_heel(b: DocBuilder, s: AirMax1Spec) -> None:
-    xs = [72 + i * 4 for i in range(26)]
-    secs = []
-    for x in xs:
-        t = (x - 72) / 100
-        z0 = midsole_top_z(x, s) + mudguard_height(x, s) * 0.85
-        h = max(8.0, upper_height(x, s) * lerp(0.42, 0.28, t))
-        secs.append(last_section(x, sole_half_width(x, s) * 0.905, z0, h, crown=0.4, count=40))
-    b.add(
-        loft_mesh(secs, cap=True),
-        name="Quarter_Suede_Overlay",
-        layer="05_Overlays::Quarter_Suede",
-        material="MAT_Suede_Overlay",
-        group="GRP_Overlays",
-        user={"VRayMaterial": "Suede_Bone"},
-    )
-
-    xs_h = [i * 3.2 for i in range(17)]
-    secs_h = []
-    for x in xs_h:
-        z0 = midsole_top_z(x, s) + mudguard_height(x, s) * 0.7
-        h = max(10.0, upper_height(x, s) * lerp(0.62, 0.38, x / 55))
-        secs_h.append(last_section(x, sole_half_width(x, s) * 0.91, z0, h, crown=0.48, count=40))
-    b.add(
-        loft_mesh(secs_h, cap=True),
-        name="Heel_Counter",
-        layer="05_Overlays::Heel_Counter",
-        material="MAT_Suede_Overlay",
-        group="GRP_Overlays",
-        user={"Branding": "NIKE AIR"},
-    )
-
-    tab = []
-    for i in range(8):
-        x = 2 + i * 2.0
-        tab.append(
-            last_section(
-                x,
-                (16 - i * 0.7) * 0.5,
-                midsole_top_z(x, s) + 30,
-                20 - i * 1.1,
-                crown=0.7,
-                count=24,
-            )
-        )
-    b.add(
-        loft_mesh(tab, cap=True),
-        name="Heel_Tab",
-        layer="05_Overlays::Heel_Tab",
-        material="MAT_Suede_Overlay",
-        group="GRP_Overlays",
-    )
-
-
-def build_swoosh(b: DocBuilder, s: AirMax1Spec) -> None:
-    samples = [
-        (178, 0.72, 9, 5.0),
-        (168, 0.84, 11, 7.5),
-        (155, 0.94, 14, 11.0),
-        (140, 0.99, 19, 13.5),
-        (125, 0.97, 25, 13.0),
-        (110, 0.90, 31, 11.0),
-        (98, 0.78, 36, 8.5),
-        (88, 0.62, 39, 6.0),
-        (80, 0.45, 38, 3.5),
-    ]
-
-    for lateral, tag in ((True, "Lateral"), (False, "Medial")):
-        sign = 1.0 if lateral else -1.0
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
         secs = []
-        for x, yf, zadd, w in samples:
-            y = sign * sole_half_width(x, s) * yf
-            z = midsole_top_z(x, s) + zadd
+        for x, yf, zadd, wh in spine:
+            y = sign * sole_half_width(x) * yf * 0.92
+            z = mudguard_top_z(x) + zadd
             local = []
-            for k in range(14):
-                a = 2 * math.pi * k / 14
-                local.append(
-                    pt(
-                        x + 1.4 * math.cos(a),
-                        y + sign * 0.9 * abs(math.cos(a)) * 0.15,
-                        z + (w * 0.5) * math.sin(a),
-                    )
-                )
+            for k in range(12):
+                a = 2 * math.pi * k / 12
+                local.append(pt(x + 1.4 * math.cos(a), y + sign * 0.8, z + wh * math.sin(a)))
             secs.append(local)
-        b.add(
-            loft_mesh(secs, cap=True),
-            name=f"Swoosh_{tag}",
-            layer="05_Overlays::Swoosh",
-            material="MAT_Synthetic_Swoosh",
-            group="GRP_Overlays",
-            user={"Side": tag},
+        d.add(loft_mesh(secs, True), f"Swoosh_{tag}", "05_Overlays::Swoosh", "MAT_LeatherBlk", "GRP_Overlays")
+
+
+def build_eyestay_hardware(d: Doc):
+    for sign, tag in ((1.0, "Lateral"), (-1.0, "Medial")):
+        xs = list(np.linspace(100, 188, 16))
+        d.add(
+            grid_shell(
+                xs,
+                lambda x: collar_top_z(x) - 22,
+                lambda x: collar_top_z(x) - 2,
+                sign,
+                n_z=6,
+                thickness=1.5,
+                width_fn=lambda x, z: 11 + 0.02 * x,
+            ),
+            f"Eyestay_{tag}",
+            "05_Overlays::Eyestay",
+            "MAT_Suede",
+            "GRP_Overlays",
         )
-
-
-def build_eyestay_and_hardware(b: DocBuilder, s: AirMax1Spec) -> None:
-    for sign, side in ((1.0, "Lateral"), (-1.0, "Medial")):
-        secs = []
-        for i in range(12):
-            x = 95 + i * 8
-            y = sign * (11.5 + i * 0.12)
-            z0 = midsole_top_z(x, s) + upper_height(x, s) * 0.58
-            secs.append(
-                [
-                    pt(x - 3, y - sign * 1.5, z0),
-                    pt(x + 3, y - sign * 1.5, z0),
-                    pt(x + 3, y + sign * 3.5, z0 + 7),
-                    pt(x - 3, y + sign * 3.5, z0 + 7),
-                ]
+        for i in range(6):
+            x = 108 + i * 13
+            y = sign * 11.0
+            z = collar_top_z(x) - 12
+            d.add(
+                cylinder_mesh(pt(x, y - sign * 1.0, z), pt(x, y + sign * 1.0, z), 2.0, 12),
+                f"Eyelet_{tag}_{i+1}",
+                "06_Hardware::Eyelets",
+                "MAT_Plastic",
+                "GRP_Hardware",
             )
-        b.add(
-            loft_mesh(secs, cap=True),
-            name=f"Eyestay_{side}",
-            layer="05_Overlays::Eyestay",
-            material="MAT_Mesh_Upper",
-            group="GRP_Overlays",
-        )
-
-        for i in range(s.eyelet_count):
-            x = 105 + i * 12
-            y = sign * 10.5
-            z = midsole_top_z(x, s) + upper_height(x, s) * 0.72
-            b.add(
-                cylinder_mesh(pt(x, y - sign * 1.1, z), pt(x, y + sign * 1.1, z), 2.1, 14),
-                name=f"Eyelet_{side}_{i+1}",
-                layer="06_Hardware::Eyelets",
-                material="MAT_Plastic_Hardware",
-                group="GRP_Hardware",
-            )
-
-        x, y = 100, sign * 11
-        z = midsole_top_z(x, s) + upper_height(x, s) * 0.78
-        b.add(
-            box_mesh(x - 4.5, y - sign * 1.2 - 2.8, z - 3.5, x + 4.5, y - sign * 1.2 + 2.8, z + 3.5),
-            name=f"LaceLock_{side}",
-            layer="06_Hardware::Lace_Lock",
-            material="MAT_Plastic_Hardware",
-            group="GRP_Hardware",
-            user={"DNA": "Rounded outline, smaller holes"},
+        # Top lace lock — rounded dual-hole piece (DNA note)
+        x, y, z = 102, sign * 11.5, collar_top_z(102) - 8
+        d.add(
+            box_mesh(x - 5, y - sign * 1.5 - 3.2, z - 4, x + 5, y - sign * 1.5 + 3.2, z + 4),
+            f"LaceLock_{tag}",
+            "06_Hardware::LaceLock",
+            "MAT_Plastic",
+            "GRP_Hardware",
         )
 
 
-def build_tongue_laces_insole(b: DocBuilder, s: AirMax1Spec) -> None:
-    secs = []
-    for i in range(14):
-        x = 112 + i * 7
-        w = lerp(26, 20, i / 13)
-        z0 = midsole_top_z(x, s) + upper_height(x, s) * 0.88
-        secs.append(last_section(x, w * 0.5, z0, s.tongue_padding, crown=0.85, count=28))
-    b.add(
-        loft_mesh(secs, cap=True),
-        name="Tongue",
-        layer="07_SoftGoods::Tongue",
-        material="MAT_Mesh_Upper",
-        group="GRP_SoftGoods",
-        user={"Padding_mm": s.tongue_padding},
+def build_softgoods(d: Doc):
+    # Tongue — tall padded piece matching product silhouette
+    xs = list(np.linspace(105, 215, 24))
+    rows = []
+    for x in xs:
+        t = (x - 105) / 110
+        w = lerp(22, 16, t)
+        z_top = tongue_top_z(x)
+        z_bot = max(collar_top_z(x) - 8, midsole_top_z(x) + 28)
+        row = []
+        for j, y in enumerate(np.linspace(-w, w, 11)):
+            v = j / 10
+            crown = math.sin(math.pi * v)
+            z = lerp(z_bot, z_top, 0.55 + 0.45 * crown)
+            row.append(pt(x, y, z))
+        rows.append(row)
+    rows_i = [[pt(p.X, p.Y, p.Z - 9.0) for p in row] for row in rows]
+    d.add(loft_pair(rows, rows_i), "Tongue", "07_SoftGoods::Tongue", "MAT_Mesh", "GRP_Soft")
+
+    # Tongue label near top
+    x_lab = 195
+    z_lab = tongue_top_z(x_lab) - 6
+    d.add(
+        box_mesh(x_lab - 7, -10, z_lab - 1.5, x_lab + 7, 10, z_lab + 1.5),
+        "Tongue_Label",
+        "07_SoftGoods::TongueLabel",
+        "MAT_Label",
+        "GRP_Soft",
     )
 
-    zlab = midsole_top_z(200, s) + 50
-    b.add(
-        box_mesh(196, -11, zlab, 209, 11, zlab + 3.5),
-        name="Tongue_Label",
-        layer="07_SoftGoods::Tongue_Label",
-        material="MAT_Tongue_Label",
-        group="GRP_SoftGoods",
-    )
-
-    for i in range(s.eyelet_count):
-        x = 105 + i * 12
-        z = midsole_top_z(x, s) + upper_height(x, s) * 0.74
-        b.add(
-            pipe_along_polyline([pt(x, -10.5, z), pt(x, 0, z + 2.5), pt(x, 10.5, z)], 1.55, 8),
-            name=f"Lace_Cross_{i+1}",
-            layer="07_SoftGoods::Laces",
-            material="MAT_Lace",
-            group="GRP_SoftGoods",
+    for i in range(6):
+        x = 112 + i * 14
+        z = collar_top_z(x) - 10
+        d.add(
+            pipe_along_polyline([pt(x, -10.5, z), pt(x + 3, 0, z + 4), pt(x, 10.5, z)], 1.55, 8),
+            f"Lace_{i+1}",
+            "07_SoftGoods::Laces",
+            "MAT_Lace",
+            "GRP_Soft",
         )
+    # Lace tails
     for sign, tag in ((-1, "L"), (1, "R")):
+        z = collar_top_z(110) - 6
         path = [
-            pt(105, sign * 10.5, midsole_top_z(105, s) + 55),
-            pt(94, sign * 5, midsole_top_z(94, s) + 61),
-            pt(88, sign * 1.5, midsole_top_z(88, s) + 57),
-            pt(96, 0, midsole_top_z(96, s) + 51),
+            pt(110, sign * 10.5, z),
+            pt(98, sign * 4, z + 14),
+            pt(92, sign * 1, z + 8),
+            pt(100, 0, z + 2),
         ]
-        b.add(
-            pipe_along_polyline(path, 1.65, 8),
-            name=f"Lace_Tail_{tag}",
-            layer="07_SoftGoods::Laces",
-            material="MAT_Lace",
-            group="GRP_SoftGoods",
+        d.add(
+            pipe_along_polyline(path, 1.6, 8),
+            f"Lace_Tail_{tag}",
+            "07_SoftGoods::Laces",
+            "MAT_Lace",
+            "GRP_Soft",
         )
 
-    xs = [18 + i * (s.external_length - 40) / 24 for i in range(25)]
-    secs = [
-        last_section(
-            x,
-            sole_half_width(x, s) * 0.76,
-            midsole_top_z(x, s) + 0.5,
-            s.insole_thickness,
-            crown=0.18,
-            count=36,
-        )
-        for x in xs
-    ]
-    b.add(
-        loft_mesh(secs, cap=True),
-        name="Insole",
-        layer="07_SoftGoods::Insole",
-        material="MAT_Insole",
-        group="GRP_SoftGoods",
-        user={"Removable": True},
+    xs = list(np.linspace(12, L - 18, 28))
+    d.add(
+        solid_loft_along_x(
+            xs,
+            lambda x: oval_section(
+                x, sole_half_width(x) * 0.75, midsole_top_z(x) + 0.5, midsole_top_z(x) + 4.0, 32, 0.25
+            ),
+        ),
+        "Insole",
+        "07_SoftGoods::Insole",
+        "MAT_Insole",
+        "GRP_Soft",
     )
 
 
-def build_reference(b: DocBuilder, s: AirMax1Spec) -> None:
-    center = [pt(x, 0, midsole_top_z(x, s)) for x in range(0, int(s.external_length) + 1, 10)]
-    b.add_curve(curve_from_pts(center, 3), name="Last_Centerline", layer="00_Reference::Last_Curves")
-    side = [
-        pt(x, sole_half_width(x, s), midsole_top_z(x, s) + mudguard_height(x, s))
-        for x in range(0, int(s.external_length) + 1, 5)
-    ]
-    b.add_curve(curve_from_pts(side, 3), name="Mudguard_Crest_Lateral", layer="00_Reference::Last_Curves")
-
-    dims = [
-        ("Dim_Length", [pt(0, -55, 0), pt(s.external_length, -55, 0)]),
-        ("Dim_HeelStack", [pt(25, 0, 0), pt(25, 0, s.heel_stack)]),
-        ("Dim_FFStack", [pt(230, 0, 0), pt(230, 0, s.forefoot_stack)]),
-        ("Dim_HeelWidth", [pt(40, -s.midsole_width_heel / 2, s.heel_stack), pt(40, s.midsole_width_heel / 2, s.heel_stack)]),
-        ("Dim_FFWidth", [pt(210, -s.midsole_width_ff / 2, s.forefoot_stack), pt(210, s.midsole_width_ff / 2, s.forefoot_stack)]),
-        ("Dim_Mudguard_Mid", [pt(140, sole_half_width(140, s), midsole_top_z(140, s)), pt(140, sole_half_width(140, s), midsole_top_z(140, s) + s.mudguard_mid_h)]),
-        ("Dim_Mudguard_Heel", [pt(30, sole_half_width(30, s), midsole_top_z(30, s)), pt(30, sole_half_width(30, s), midsole_top_z(30, s) + s.mudguard_heel_h)]),
-    ]
-    for name, pts in dims:
-        b.add_curve(curve_from_pts(pts, 1), name=name, layer="00_Reference::Dimensions")
-
-
-def main() -> None:
-    s = SPEC
-    b = DocBuilder()
-    setup_document(b)
-    build_reference(b, s)
-    build_outsole(b, s)
-    build_midsole(b, s)
-    build_air_unit(b, s)
-    build_upper_shells(b, s)
-    build_mudguard(b, s)
-    build_quarter_and_heel(b, s)
-    build_swoosh(b, s)
-    build_eyestay_and_hardware(b, s)
-    build_tongue_laces_insole(b, s)
-    b.save(OUT_PATH)
-    print(f"Wrote {OUT_PATH}")
-    print(f"Objects: {len(b.doc.Objects)}  Layers: {len(b.doc.Layers)}  Materials: {len(b.doc.Materials)}  Bytes: {OUT_PATH.stat().st_size}")
+def main():
+    d = Doc()
+    setup(d)
+    build_profiles(d)
+    build_outsole(d)
+    build_midsole(d)
+    build_air_unit(d)
+    build_upper(d)
+    build_mudguard(d)
+    build_suede_overlays(d)
+    build_swoosh(d)
+    build_eyestay_hardware(d)
+    build_softgoods(d)
+    d.save(OUT)
+    print(f"Wrote {OUT}")
+    print(f"Objects={len(d.doc.Objects)} Layers={len(d.doc.Layers)} Mats={len(d.doc.Materials)} Bytes={OUT.stat().st_size}")
 
 
 if __name__ == "__main__":
